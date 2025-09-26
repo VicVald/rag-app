@@ -1,0 +1,38 @@
+services:
+  api:
+    image: vhusertest/rag-app-api:latest
+    container_name: rag_api
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=agno_user
+      - POSTGRES_PASSWORD=agno_password_123
+      - POSTGRES_DB=agno_db
+
+  postgres:
+    image: vhusertest/rag-app-postgres:latest
+    container_name: rag_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: agno_user
+      POSTGRES_PASSWORD: agno_password_123
+      POSTGRES_DB: agno_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
