@@ -9,6 +9,10 @@ from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 from agno.tools.calculator import CalculatorTools
 
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+
 # Carrega variáveis de ambiente
 load_dotenv()
 
@@ -27,8 +31,20 @@ qdrant_client = QdrantClient(
 # Modelo de embeddings
 model = SentenceTransformer("/app/model")  # já baixado no Dockerfile
 
+# Variável global para armazenar dados da última consulta
+last_query_results = []
+
 # Função de consulta ao Qdrant
-def query_database(query: str):
+def query_database(query: str) -> list:
+    """
+    Tool for querying the knowledge database about agricultural topics when needed
+
+    Args: 
+    query (str): Query to search in the knowledge database
+
+    """
+    global last_query_results
+    
     query_vector = model.encode(query).tolist()
     points = qdrant_client.query_points(
         collection_name="sb100",
@@ -37,7 +53,19 @@ def query_database(query: str):
         query=query_vector,
         using="vetor_denso"
     )
-    return points
+    
+    # Armazena os resultados formatados para o frontend
+    last_query_results = []
+    for point in points.points:
+        formatted_point = {
+            "id": point.id,
+            "score": point.score,
+            "content": point.payload.get("content", ""),
+            "file": point.payload.get("file", "")
+        }
+        last_query_results.append(formatted_point)
+    
+    return points.points
 
 # Ferramentas disponíveis
 tools = [query_database, CalculatorTools()]
@@ -62,22 +90,36 @@ else:
         database=postgres_config["database"],
         memory_table="my_memory_table"
     )
-
 # Cria o agente
 agent = Agent(
-    model=Groq(),
+    # model=Groq(),
+    # model=Groq("llama-3.1-8b-instant"),
+    model=Groq("meta-llama/llama-4-scout-17b-16e-instruct"),
     instructions="""
-    You are a helpful assistant to help farmers with soil recommendations.
-    Use the knowledge_base when necessary to answer questions about soil fertilization.
-    If you don't know the answer, just say you don't know. Do not try to make up an answer.
-    If the answer needs to show specific data create tables for explanation.
+    Você é um **Assistente Agrônomo** útil e prático. Seu objetivo é ajudar agricultores respondendo perguntas gerais sobre agricultura, utilizando a ferramenta **query_database** (base de conhecimento) sempre que necessário.
 
-    Keep your answers conversational and easy to understand but concise.
+    **REGRAS CRUCIAIS (RAG e Segurança):**
+    1.  **Fonte Única:** A `knowledge_base` é sua **única fonte de conhecimento**. Se a resposta não estiver lá, diga educadamente que não possui essa informação. **NUNCA invente, deduza ou tente adivinhar** dados ou respostas.
+    2.  **Uso da Base:** Sempre que uma pergunta puder ser respondida com dados ou fatos agrícolas, **priorize a consulta e a citação** da `query_database`.
+    3.  **Cheque Factual:** Sempre reveja se as informações fornecidas pela `query_database` fazem sentido no contexto da pergunta. Se houver inconsistências como a resposta ser para outra cultura diga que não possui essa informação.
+
+    **ESTILO E FORMATO:**
+    1.  **Tom de Voz:** Mantenha um tom de voz **conversacional, prático e confiável** (como um consultor de campo experiente).
+    2.  **Fluidez:** Para manter a conversa natural e não robótica, você pode iniciar respostas com frases como:
+        * "Com base nas informações que tenho..."
+        * "Minha pesquisa na base de dados indica que..."
+        * "Não tenho acesso a dados em tempo real, mas [a base de conhecimento] sugere que..."
+    3.  **Clareza:** Suas respostas devem ser **fáceis de entender, mas concisas**. Evite jargões desnecessários ou explicações excessivamente longas.
+    4.  **Dados:** Se a resposta precisar mostrar dados ou comparações específicas, utilize **tabelas claras e bem formatadas** para melhor explicação.
+
+    **IDIOMA:**
+    1.  Toda a comunicação, incluindo perguntas e respostas, deve ser **EXCLUSIVAMENTE em português do Brasil**.
     """,
     tools=tools,
     db=db,
     enable_user_memories=True,
-    debug_mode=True
+    debug_mode=True,
+    store_events=True
 )
 
 # =======================
@@ -85,17 +127,54 @@ agent = Agent(
 # =======================
 app = FastAPI(title="RAG API", version="1.0")
 
+origins = [
+    "*"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Schema para requisição
 class ChatRequest(BaseModel):
     user_id: str
     session_id: str
     message: str
 
-@app.post("/chat")
+# Schema para resposta
+class ChatResponse(BaseModel):
+    response: str
+    sources: list = []
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint para AWS ECS"""
+    return {"status": "healthy", "service": "rag-api"}
+
+@app.get("/")
+def root():
+    """Root endpoint"""
+    return {"message": "RAG API está funcionando!", "docs": "/docs"}
+
+@app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
+    global last_query_results
+    
+    # Limpa resultados anteriores
+    last_query_results = []
+    
+    # Executa o agent
     response = agent.run(
         input=request.message,
         user_id=request.user_id,
-        session_id=request.session_id
+        session_id=request.session_id,
     )
-    return {"response": response}
+    
+    return ChatResponse(
+        response=response.content,
+        sources=last_query_results
+    )
